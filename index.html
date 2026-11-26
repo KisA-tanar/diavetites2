@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<title>Iskolai diavetítés</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    cursor: none;
+  }
+  .slide {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    background-color: #000;
+    background-position: center center;
+    background-repeat: no-repeat;
+    background-size: contain;      /* "cover"-re cserélve kitölti a képernyőt, de levághat a képből */
+    opacity: 0;
+    -webkit-transition: opacity 1s ease;
+    transition: opacity 1s ease;
+  }
+  .slide.show { opacity: 1; }
+  #msg {
+    position: absolute; left: 0; right: 0; top: 45%;
+    padding: 0 60px;
+    text-align: center;
+    color: #999;
+    font: 32px/1.4 Arial, Helvetica, sans-serif;
+    display: none;
+  }
+</style>
+</head>
+<body>
+
+<div class="slide" id="layerA"></div>
+<div class="slide" id="layerB"></div>
+<div id="msg"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ===================== BEÁLLÍTÁSOK ===================== */
+  var CONFIG = {
+    owner: '',               // GitHub felhasználónév. Üresen hagyva a webcímből kitalálja.
+    repo: '',                // repository neve. Üresen hagyva a webcímből kitalálja.
+    folder: 'kepek',         // a képek mappája a repositoryban (perjel nélkül)
+    seconds: 10,             // ennyi másodpercig látszik egy kép
+    retrySeconds: 30,        // ennyi idő után próbálkozik újra hiba esetén
+    listRefreshMinutes: 10,  // ilyen sűrűn kérdezi le újra a képek listáját (a kör végén)
+    reloadMinutes: 60        // ilyen gyakran tölti újra az egész oldalt (memória miatt)
+  };
+  /* ======================================================== */
+
+  var IMAGE_RE = /\.(jpe?g|png)$/i;
+
+  var layers = [document.getElementById('layerA'), document.getElementById('layerB')];
+  var msgEl = document.getElementById('msg');
+  var version = new Date().getTime();   // cache-ellen: minden újratöltésnél új
+  var list = [];                        // a képfájlok nevei, sorba rendezve
+  var idx = -1;                         // a most mutatott kép helye a listában
+  var active = 0;                       // melyik réteg látszik éppen
+  var lastListFetch = 0;
+  var failures = 0;
+
+  /* ---------- segédfüggvények ---------- */
+
+  function showMessage(text) {
+    msgEl.innerHTML = text;
+    msgEl.style.display = 'block';
+  }
+
+  function hideMessage() {
+    msgEl.style.display = 'none';
+  }
+
+  function imageUrl(name) {
+    return CONFIG.folder + '/' + encodeURIComponent(name) + '?v=' + version;
+  }
+
+  // A rendezési kulcs a fájlnév első kötőjel előtti része (a "szám").
+  // Szövegként hasonlítjuk össze: 0 < 01 < 015 < 02 < 1 < 10 < 2
+  function sortKey(name) {
+    var i = name.indexOf('-');
+    return i > 0 ? name.substring(0, i) : name;
+  }
+
+  function compareNames(a, b) {
+    var ka = sortKey(a), kb = sortKey(b);
+    if (ka < kb) { return -1; }
+    if (ka > kb) { return 1; }
+    if (a < b) { return -1; }
+    if (a > b) { return 1; }
+    return 0;
+  }
+
+  // A GitHub Pages címéből kitalálja a felhasználót és a repository nevét.
+  function detectRepo() {
+    var owner = CONFIG.owner;
+    var repo = CONFIG.repo;
+    var host = location.hostname;
+    var seg = location.pathname.split('/')[1] || '';
+    if (/\./.test(seg)) { seg = ''; }   // pl. "index.html" nem repo név
+    if (!owner && /\.github\.io$/i.test(host)) { owner = host.split('.')[0]; }
+    if (!repo) { repo = seg ? seg : (owner ? owner + '.github.io' : ''); }
+    return { owner: owner, repo: repo };
+  }
+
+  /* ---------- a képlista lekérése a GitHubról ---------- */
+
+  function fetchList(done) {
+    var r = detectRepo();
+    var finished = false;
+
+    function finish(ok) {
+      if (finished) { return; }
+      finished = true;
+      done(ok);
+    }
+
+    if (!r.owner || !r.repo) { finish(false); return; }
+
+    var url = 'https://api.github.com/repos/' + r.owner + '/' + r.repo +
+              '/contents/' + CONFIG.folder + '?t=' + new Date().getTime();
+    var xhr = new XMLHttpRequest();
+
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) { return; }
+      if (xhr.status === 200) {
+        try {
+          var items = JSON.parse(xhr.responseText);
+          var names = [];
+          for (var i = 0; i < items.length; i++) {
+            if (items[i].type === 'file' && IMAGE_RE.test(items[i].name)) {
+              names.push(items[i].name);
+            }
+          }
+          if (names.length > 0) {
+            names.sort(compareNames);
+            list = names;
+            lastListFetch = new Date().getTime();
+            finish(true);
+            return;
+          }
+        } catch (e) { /* hibás válasz: lent false */ }
+      }
+      finish(false);
+    };
+
+    try {
+      xhr.open('GET', url, true);
+      xhr.send();
+    } catch (e) {
+      finish(false);
+      return;
+    }
+    setTimeout(function () { finish(false); }, 10000);   // 10 mp után feladja
+  }
+
+  /* ---------- megjelenítés ---------- */
+
+  function loadImage(name, onOk, onFail) {
+    var img = new Image();
+    img.onload = function () { onOk(); };
+    img.onerror = function () { onFail(); };
+    img.src = imageUrl(name);
+  }
+
+  function display(i) {
+    var nextLayer = 1 - active;
+    layers[nextLayer].style.backgroundImage = 'url("' + imageUrl(list[i]) + '")';
+    layers[nextLayer].className = 'slide show';
+    layers[active].className = 'slide';
+    active = nextLayer;
+    idx = i;
+    hideMessage();
+
+    // a következő kép előtöltése
+    var pre = new Image();
+    pre.src = imageUrl(list[(i + 1) % list.length]);
+
+    setTimeout(next, CONFIG.seconds * 1000);
+  }
+
+  function showAt(i) {
+    loadImage(list[i], function () {
+      failures = 0;
+      display(i);
+    }, function () {
+      // Nem tölthető be (pl. még nem frissült az oldal): átugorjuk.
+      failures++;
+      if (failures >= list.length) {
+        failures = 0;
+        showMessage('A képek nem tölthetők be. Újrapróbálkozás hamarosan.');
+        setTimeout(start, CONFIG.retrySeconds * 1000);
+      } else {
+        next();
+      }
+    });
+  }
+
+  function next() {
+    idx++;
+    if (idx >= list.length) {
+      idx = 0;
+      var age = new Date().getTime() - lastListFetch;
+      if (age > CONFIG.listRefreshMinutes * 60 * 1000) {
+        // a kör végén megnézzük, jöttek-e új képek; hiba esetén a régi lista marad
+        fetchList(function () {
+          idx = 0;
+          showAt(0);
+        });
+        return;
+      }
+    }
+    showAt(idx);
+  }
+
+  function start() {
+    fetchList(function () {
+      if (list.length > 0) {
+        idx = -1;
+        next();
+      } else {
+        showMessage('Nem található kép a(z) „' + CONFIG.folder + '” mappában.');
+        setTimeout(start, CONFIG.retrySeconds * 1000);
+      }
+    });
+  }
+
+  /* ---------- óránkénti újratöltés ---------- */
+
+  function safeReload() {
+    var xhr = new XMLHttpRequest();
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) { return; }
+      if (xhr.status === 200) {
+        location.reload();
+      } else {
+        setTimeout(safeReload, 60 * 1000);
+      }
+    };
+    try {
+      xhr.open('GET', location.pathname + '?r=' + new Date().getTime(), true);
+      xhr.send();
+    } catch (e) {
+      setTimeout(safeReload, 60 * 1000);
+    }
+  }
+
+  setTimeout(safeReload, CONFIG.reloadMinutes * 60 * 1000);
+  start();
+})();
+</script>
+</body>
+</html>
